@@ -1,0 +1,15 @@
+logger:
+  type: spdlog
+  levels:
+    tll: WARNING
+    tll.channel.pcap: DEBUG
+    tll.channel.udp*: DEBUG
+
+processor.module:
+  pcap.module: ./build/tll-pcap
+
+processor.objects:
+  pcap:
+    url: pcap://lo;live=yes;dump=frame;shutdown-on=close
+  udp:
+    url: pcap+udp://::1:5555;master=pcap;dump=frame
