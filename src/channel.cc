@@ -18,6 +18,7 @@
 #include <netinet/udp.h>
 
 #include <pcap.h>
+#include <pcap/vlan.h>
 
 class Child;
 
@@ -63,24 +64,29 @@ class PCap : public tll::channel::Base<PCap>
 	}
 
  private:
+	struct Frame
+	{
+		unsigned short vlan = 0;
+	};
 
 	template <typename View>
-	int _on_ether(tll_msg_t &msg, View view);
+	int _on_ether(tll_msg_t &msg, Frame &frame, View view);
 
 	template <typename View>
-	int _on_ip(tll_msg_t &msg, View view);
+	int _on_ip(tll_msg_t &msg, Frame &frame, View view);
 
 	template <typename View>
-	int _on_ipv6(tll_msg_t &msg, View view);
+	int _on_ipv6(tll_msg_t &msg, Frame &frame, View view);
 
 	template <typename Addr>
-	int _match(tll_msg_t &msg, const Addr &addr);
+	int _match(tll_msg_t &msg, const Frame &frame, const Addr &addr);
 };
 
 class Child : public tll::channel::Base<Child>
 {
 	PCap * _master = nullptr;
 	tll::network::sockaddr_any _addr;
+	unsigned short _vlan = 0;
 
  public:
 	static constexpr std::string_view channel_protocol() { return "pcap+udp"; }
@@ -94,6 +100,7 @@ class Child : public tll::channel::Base<Child>
 
 		auto reader = channel_props_reader(url);
 		auto af = reader.getT("af", tll::network::AddressFamily::UNSPEC);
+		_vlan = reader.getT<unsigned short>("vlan", 0);
 		if (!reader)
 			return _log.fail(EINVAL, "Invalid arguments: {}", reader.error());
 		auto r = tll::network::parse_hostport(url.host(), af);
@@ -124,6 +131,7 @@ class Child : public tll::channel::Base<Child>
 	//const tll::network::sockaddr_any & addr() const { return _addr; }
 	//tll::network::sockaddr_any & addr() { return _addr; }
 	auto & addr() { return _addr; }
+	auto vlan() const { return _vlan; }
 };
 
 int PCap::_init(const tll::Channel::Url &url, tll::Channel *master)
@@ -196,18 +204,24 @@ int PCap::_close()
 }
 
 template <typename Addr>
-int PCap::_match(tll_msg_t &msg, const Addr &addr)
+int PCap::_match(tll_msg_t &msg, const PCap::Frame &frame, const Addr &addr)
 {
 	for (auto & c : _children) {
 		//_log.debug("Match {} with {}", addr, c->addr());
-		if (c && c->addr() == &addr)
-			c->_callback_data(&msg);
+		if (!c)
+			continue;
+		if (c->vlan() != frame.vlan)
+			continue;
+		if (c->addr() != &addr)
+			continue;
+		c->_callback_data(&msg);
+		return 0;
 	}
 	return 0;
 }
 
 template <typename View>
-int PCap::_on_ether(tll_msg_t &msg, View view)
+int PCap::_on_ether(tll_msg_t &msg, Frame &frame, View view)
 {
 	auto ehdr = view.template dataT<ether_header>();
 	if (view.size() < sizeof(*ehdr))
@@ -215,21 +229,33 @@ int PCap::_on_ether(tll_msg_t &msg, View view)
 	auto type = ntohs(ehdr->ether_type);
 	//_log.debug("Packet type 0x{:x} from {} to {}", type, *(ether_addr *) &ehdr->ether_shost, *(ether_addr *) &ehdr->ether_dhost);
 	view = view.view(sizeof(*ehdr));
-	switch (type) {
-	case ETHERTYPE_IP:
-		return _on_ip(msg, view);
-	case ETHERTYPE_IPV6:
-		return _on_ipv6(msg, view);
-	default:
-		break;
+	while (true) {
+		_log.trace("Check ethertype 0x{:04x}", type);
+		switch (type) {
+		case ETHERTYPE_IP:
+			return _on_ip(msg, frame, view);
+		case ETHERTYPE_IPV6:
+			return _on_ipv6(msg, frame, view);
+		case ETHERTYPE_VLAN: {
+			if (view.size() < sizeof(vlan_tag))
+				return _log.fail(EINVAL, "Truncated packet: {} < {} vlan frame size", view.size(), sizeof(vlan_tag));
+			auto vhdr = view.template dataT<uint16_t>();
+			frame.vlan = ntohs(*vhdr & 0xfff0u);
+			type = ntohs(vhdr[1]);
+			_log.info("Handle VLAN header: {}", frame.vlan);
+			view = view.view(sizeof(vlan_tag));
+			break;
+		}
+		default:
+			_log.debug("Skip non-ip packet 0x{:x}", type);
+			return 0;
+		}
 	}
-
-	_log.debug("Skip non-ip packet 0x{:x}", type);
 	return 0;
 }
 
 template <typename View>
-int PCap::_on_ip(tll_msg_t &msg, View view)
+int PCap::_on_ip(tll_msg_t &msg, Frame &frame, View view)
 {
 	_log.trace("IP packet size {}", view.size());
 
@@ -251,14 +277,14 @@ int PCap::_on_ip(tll_msg_t &msg, View view)
 		view = view.view(sizeof(*udp));
 		msg.data = view.data();
 		msg.size = view.size();
-		return _match(msg, addr);
+		return _match(msg, frame, addr);
 	}
 
 	return 0;
 }
 
 template <typename View>
-int PCap::_on_ipv6(tll_msg_t &msg, View view)
+int PCap::_on_ipv6(tll_msg_t &msg, Frame &frame, View view)
 {
 	_log.trace("IPv6 packet size {}", view.size());
 
@@ -280,7 +306,7 @@ int PCap::_on_ipv6(tll_msg_t &msg, View view)
 		view = view.view(sizeof(*udp));
 		msg.data = view.data();
 		msg.size = view.size();
-		return _match(msg, addr);
+		return _match(msg, frame, addr);
 	}
 
 	/*
@@ -322,13 +348,15 @@ int PCap::_process(long timeout, int flags)
 	tll_msg_t msg = { TLL_MESSAGE_DATA };
 	msg.time = ts2ts(&hdr->ts);
 
+	Frame frame = {};
+
 	_log.trace("Capture size {}", view.size());
 	switch (_linktype) {
 	case DLT_EN10MB:
-		_on_ether(msg, view);
+		_on_ether(msg, frame, view);
 		break;
 	case DLT_RAW:
-		_on_ip(msg, view);
+		_on_ip(msg, frame, view);
 		break;
 	}
 
