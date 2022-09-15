@@ -242,7 +242,7 @@ int PCap::_on_ether(tll_msg_t &msg, Frame &frame, View view)
 			auto vhdr = view.template dataT<uint16_t>();
 			frame.vlan = ntohs(*vhdr & 0xfff0u);
 			type = ntohs(vhdr[1]);
-			_log.info("Handle VLAN header: {}", frame.vlan);
+			_log.debug("Handle VLAN header: {}", frame.vlan);
 			view = view.view(sizeof(vlan_tag));
 			break;
 		}
