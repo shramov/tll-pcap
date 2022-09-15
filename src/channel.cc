@@ -8,9 +8,12 @@
 #include <tll/channel/base.h>
 #include <tll/channel/module.h>
 
+#include <tll/scheme/channel/timer.h>
+
 #include <tll/util/memoryview.h>
 #include <tll/util/size.h>
 #include <tll/util/sockaddr.h>
+#include <tll/util/time.h>
 
 #include <net/ethernet.h>
 #include <netinet/ip.h>
@@ -22,7 +25,10 @@
 
 class Child;
 
-long long ts2ts(const struct timeval * tv) { return tv->tv_sec * 1000000000ll + tv->tv_usec; } // ns, not us
+tll::time_point ts2ts(const struct timeval * tv)
+{
+	return tll::time_point { std::chrono::seconds(tv->tv_sec) + std::chrono::nanoseconds(tv->tv_usec) };
+}
 
 class PCap : public tll::channel::Base<PCap>
 {
@@ -35,12 +41,25 @@ class PCap : public tll::channel::Base<PCap>
 
 	std::list<Child *> _children;
 
+	pcap_pkthdr * _pcap_hdr = nullptr;
+	const u_char * _pcap_data = nullptr;
+
+	double _speed = 0;
+	tll::time_point _pcap_epoch = {};
+	tll::time_point _wall_epoch = {};
+	std::unique_ptr<tll::Channel> _timer;
+
  public:
 	static constexpr std::string_view channel_protocol() { return "pcap"; }
+	static constexpr auto process_policy() { return ProcessPolicy::Custom; }
 
 	int _init(const tll::Channel::Url &, tll::Channel *master);
 	int _open(const tll::ConstConfig &);
 	int _close();
+	void _free()
+	{
+		_timer.reset();
+	}
 
 	int _process(long timeout, int flags);
 
@@ -63,11 +82,18 @@ class PCap : public tll::channel::Base<PCap>
 		}
 	}
 
+	int callback(const tll::Channel * c, const tll_msg_t * msg);
+
  private:
 	struct Frame
 	{
 		unsigned short vlan = 0;
 	};
+
+	int _on_pcap(pcap_pkthdr * hdr, const u_char * data);
+	tll::time_point _when(const tll::time_point &now, const tll::time_point &ts);
+
+	int _pcap_read();
 
 	template <typename View>
 	int _on_ether(tll_msg_t &msg, Frame &frame, View view);
@@ -80,6 +106,19 @@ class PCap : public tll::channel::Base<PCap>
 
 	template <typename Addr>
 	int _match(tll_msg_t &msg, const Frame &frame, const Addr &addr);
+
+	int _rearm(const tll::time_point &ts)
+	{
+		timer_scheme::absolute m = { ts };
+		tll_msg_t msg = {};
+		msg.type = TLL_MESSAGE_DATA;
+		msg.msgid = m.id;
+		msg.data = &m;
+		msg.size = sizeof(m);
+		if (_timer->post(&msg))
+			return _log.fail(EINVAL, "Failed to rearm timer");
+		return 0;
+	}
 };
 
 class Child : public tll::channel::Base<Child>
@@ -143,13 +182,33 @@ int PCap::_init(const tll::Channel::Url &url, tll::Channel *master)
 	_autoclose = reader.getT("autoclose", true);
 	_live = reader.getT("live", false);
 	_snaplen = reader.getT("snaplen", tll::util::Size { 1500 });
+	_speed = reader.getT<double>("speed", 0);
 	if (!reader)
 		return _log.fail(EINVAL, "Invalid arguments: {}", reader.error());
+
+	if (_speed < 0)
+		return _log.fail(EINVAL, "Negative speed divisor: {}", _speed);
+	if (_speed) {
+		if (_live)
+			return _log.fail(EINVAL, "Can not set speed of live capture");
+		auto curl = child_url_parse("timer://;clock=realtime", "timer");
+		if (!curl)
+			return _log.fail(EINVAL, "Failed to parse timer url: {}", curl.error());
+		_timer = context().channel(*curl);
+		if (!_timer)
+			return _log.fail(EINVAL, "Failed to create timer");
+		_timer->callback_add(this);
+		internal.caps |= tll::caps::Parent;
+		_child_add(_timer.get(), "timer");
+	}
 	return 0;
 }
 
 int PCap::_open(const tll::ConstConfig &)
 {
+	_pcap_hdr = nullptr;
+	_pcap_data = nullptr;
+
 	char errbuf[PCAP_ERRBUF_SIZE];
 	if (_live) {
 		_log.debug("Open live device {}", _filename);
@@ -179,7 +238,6 @@ int PCap::_open(const tll::ConstConfig &)
 		_pcap = pcap_open_offline_with_tstamp_precision(_filename.c_str(), PCAP_TSTAMP_PRECISION_NANO, errbuf);
 		if (!_pcap)
 			return _log.fail(EINVAL, "Failed to open file '{}': {}", _filename, errbuf);
-		_dcaps_pending(true);
 	}
 
 	_linktype = pcap_datalink(_pcap);
@@ -191,6 +249,15 @@ int PCap::_open(const tll::ConstConfig &)
 	default:
 		return _log.fail(EINVAL, "Unknown link type: {}", _linktype);
 	}
+
+	if (_speed) {
+		_update_dcaps(0, tll::dcaps::Process | tll::dcaps::Pending);
+		if (_timer->open())
+			return _log.fail(EINVAL, "Failed to open timer channel");
+		_rearm(tll::time::now());
+	} else
+		_update_dcaps(tll::dcaps::Pending | tll::dcaps::Process);
+
 	return 0;
 }
 
@@ -330,27 +397,91 @@ int PCap::_on_ipv6(tll_msg_t &msg, Frame &frame, View view)
 	return 0;
 }
 
-int PCap::_process(long timeout, int flags)
+int PCap::_pcap_read()
 {
-	pcap_pkthdr *hdr;
-	const u_char * data;
-	auto r = pcap_next_ex(_pcap, &hdr, &data);
+	auto r = pcap_next_ex(_pcap, &_pcap_hdr, &_pcap_data);
+	if (r == 1)
+		return 0;
+	else if (r == 0) // No data available from live capture
+		return EAGAIN;
+
 	if (r == PCAP_ERROR_BREAK) {
 		_log.info("Dump finished");
 		if (!_autoclose) {
 			_update_fd(-1);
 			_update_dcaps(0, tll::dcaps::Process | tll::dcaps::Pending | tll::dcaps::CPOLLIN);
+			if (_timer)
+				_timer->close();
 		} else {
 			close();
 		}
-		return 0;
-	} else if (r == 0)
 		return EAGAIN;
+	}
+
+	return state_fail(EINVAL, "Failed to read data from pcap: {}", pcap_geterr(_pcap));
+}
+
+int PCap::_process(long timeout, int flags)
+{
+	if (auto r = _pcap_read(); r)
+		return r;
+	return _on_pcap(_pcap_hdr, _pcap_data);
+}
+
+int PCap::callback(const tll::Channel * c, const tll_msg_t * msg)
+{
+	if (msg->type != TLL_MESSAGE_DATA)
+		return 0;
+	if (!_pcap_hdr) {
+		if (auto r = _pcap_read(); r)
+			return r;
+	}
+
+	auto hdr = _pcap_hdr;
+	auto ts = ts2ts(&hdr->ts);
+	auto now = tll::time::now();
+	auto next = _when(now, ts);
+	if (next > now) {
+		_rearm(next);
+		return EAGAIN;
+	}
+
+	_pcap_hdr = nullptr;
+
+	if (auto r = _on_pcap(hdr, _pcap_data); r)
+		return r;
+	
+	if (!_pcap) // Closed in callback
+		return 0;
+	
+	if (auto r = _pcap_read(); r)
+		return r;
+
+	now = tll::time::now();
+	_rearm(_when(now, ts2ts(&_pcap_hdr->ts)));
+	return 0;
+}
+
+tll::time_point PCap::_when(const tll::time_point &now, const tll::time_point &ts)
+{
+	if (!_speed)
+		return now;
+
+	if (_pcap_epoch == tll::time_point {}) {
+		_pcap_epoch = ts;
+		_wall_epoch = now;
+	}
+
+	return _wall_epoch + std::chrono::duration_cast<tll::duration>((ts - _pcap_epoch) / _speed);
+}
+
+int PCap::_on_pcap(pcap_pkthdr * hdr, const u_char * data)
+{
 	const tll::const_memory mem = { data, hdr->len };
 	auto view = tll::make_view(mem);
 
 	tll_msg_t msg = { TLL_MESSAGE_DATA };
-	msg.time = ts2ts(&hdr->ts);
+	msg.time = ts2ts(&hdr->ts).time_since_epoch().count();
 
 	Frame frame = {};
 
