@@ -200,6 +200,10 @@ int PCap::_close()
 		pcap_close(_pcap);
 	_pcap = nullptr;
 	_update_fd(-1);
+	for (auto & c : _children) {
+		if (c)
+			c->close();
+	}
 	return 0;
 }
 
