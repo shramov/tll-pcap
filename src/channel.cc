@@ -44,6 +44,7 @@ class PCap : public tll::channel::Base<PCap>
 	pcap_pkthdr * _pcap_hdr = nullptr;
 	const u_char * _pcap_data = nullptr;
 
+	long long _seq = 0;
 	double _speed = 0;
 	tll::time_point _pcap_epoch = {};
 	tll::time_point _wall_epoch = {};
@@ -126,6 +127,8 @@ class Child : public tll::channel::Base<Child>
 	PCap * _master = nullptr;
 	tll::network::sockaddr_any _addr;
 	unsigned short _vlan = 0;
+	long long _seq = 0;
+	bool _autoseq = true;
 
  public:
 	static constexpr std::string_view channel_protocol() { return "pcap+udp"; }
@@ -140,6 +143,7 @@ class Child : public tll::channel::Base<Child>
 		auto reader = channel_props_reader(url);
 		auto af = reader.getT("af", tll::network::AddressFamily::UNSPEC);
 		_vlan = reader.getT<unsigned short>("vlan", 0);
+		_autoseq = reader.getT("autoseq", true);
 		if (!reader)
 			return _log.fail(EINVAL, "Invalid arguments: {}", reader.error());
 		auto r = tll::network::parse_hostport(url.host(), af);
@@ -158,6 +162,7 @@ class Child : public tll::channel::Base<Child>
 	int _open(const tll::ConstConfig &)
 	{
 		_master->reg(this);
+		_seq = 0;
 		return 0;
 	}
 
@@ -171,6 +176,8 @@ class Child : public tll::channel::Base<Child>
 	//tll::network::sockaddr_any & addr() { return _addr; }
 	auto & addr() { return _addr; }
 	auto vlan() const { return _vlan; }
+	auto autoseq() { return _autoseq; }
+	auto & seq() { return _seq; }
 };
 
 int PCap::_init(const tll::Channel::Url &url, tll::Channel *master)
@@ -208,6 +215,7 @@ int PCap::_open(const tll::ConstConfig &)
 {
 	_pcap_hdr = nullptr;
 	_pcap_data = nullptr;
+	_seq = 0;
 
 	char errbuf[PCAP_ERRBUF_SIZE];
 	if (_live) {
@@ -285,7 +293,11 @@ int PCap::_match(tll_msg_t &msg, const PCap::Frame &frame, const Addr &addr)
 			continue;
 		if (c->addr() != &addr)
 			continue;
+		auto seq = msg.seq;
+		if (c->autoseq())
+			msg.seq = c->seq()++;
 		c->_callback_data(&msg);
+		msg.seq = seq;
 		return 0;
 	}
 	return 0;
@@ -481,6 +493,7 @@ int PCap::_on_pcap(pcap_pkthdr * hdr, const u_char * data)
 	auto view = tll::make_view(mem);
 
 	tll_msg_t msg = { TLL_MESSAGE_DATA };
+	msg.seq = _seq;
 	msg.time = ts2ts(&hdr->ts).time_since_epoch().count();
 
 	Frame frame = {};
@@ -497,6 +510,8 @@ int PCap::_on_pcap(pcap_pkthdr * hdr, const u_char * data)
 
 	msg.data = view.data();
 	msg.size = view.size();
+	msg.seq = _seq;
+	_seq++;
 	_callback_data(&msg);
 	return 0;
 }
