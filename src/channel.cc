@@ -50,6 +50,8 @@ class PCap : public tll::channel::Base<PCap>
 	tll::time_point _wall_epoch = {};
 	std::unique_ptr<tll::Channel> _timer;
 
+	std::string _filter;
+
  public:
 	static constexpr std::string_view channel_protocol() { return "pcap"; }
 	static constexpr auto process_policy() { return ProcessPolicy::Custom; }
@@ -190,6 +192,7 @@ int PCap::_init(const tll::Channel::Url &url, tll::Channel *master)
 	_live = reader.getT("live", false);
 	_snaplen = reader.getT("snaplen", tll::util::Size { 1500 });
 	_speed = reader.getT<double>("speed", 0);
+	_filter = reader.getT<std::string>("filter", "");
 	if (!reader)
 		return _log.fail(EINVAL, "Invalid arguments: {}", reader.error());
 
@@ -246,6 +249,16 @@ int PCap::_open(const tll::ConstConfig &)
 		_pcap = pcap_open_offline_with_tstamp_precision(_filename.c_str(), PCAP_TSTAMP_PRECISION_NANO, errbuf);
 		if (!_pcap)
 			return _log.fail(EINVAL, "Failed to open file '{}': {}", _filename, errbuf);
+	}
+
+	if (_filter.size()) {
+		struct bpf_program bpf = {};
+		if (pcap_compile(_pcap, &bpf, _filter.c_str(), 1, PCAP_NETMASK_UNKNOWN))
+			return _log.fail(EINVAL, "Failed to compile BPF: {}\n\t{}", pcap_geterr(_pcap), _filter);
+		auto r = pcap_setfilter(_pcap, &bpf);
+		pcap_freecode(&bpf);
+		if (r)
+			return _log.fail(EINVAL, "Failed to set BPF filter: {}", pcap_geterr(_pcap));
 	}
 
 	_linktype = pcap_datalink(_pcap);

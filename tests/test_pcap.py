@@ -73,6 +73,28 @@ def test_ipv4(context, master):
     assert [m.seq for m in v0.result] == list(range(6))
     assert [m.seq for m in v1.result] == list(range(6))
 
+def test_bpf(context):
+    master = context.Channel('pcap://tests/udp.pcap', name='master', dump='frame', autoclose='yes', filter='(udp port 5555) or (vlan 166 and udp port 5556)')
+    u0 = Accum('pcap+udp://10.22.17.253:5555', dump='frame', master=master, context=context, name='udp0', autoseq='no')
+    u1 = Accum('pcap+udp://10.22.17.253:5556', dump='frame', master=master, context=context, name='udp1', autoseq='no')
+    v0 = Accum('pcap+udp://10.23.17.253:5555', dump='frame', master=master, context=context, name='vlan0', vlan='166')
+    v1 = Accum('pcap+udp://10.23.17.253:5556', dump='frame', master=master, context=context, name='vlan1', vlan='166')
+    master.open()
+    u0.open()
+    u1.open()
+    v0.open()
+    v1.open()
+
+    for _ in range(100):
+        if master.state != master.State.Active:
+            break
+        master.process()
+
+    assert [m.data.tobytes() for m in u0.result] == [b'ipv4:5555'] * 6
+    assert [m.data.tobytes() for m in u1.result] == []
+    assert [m.data.tobytes() for m in v0.result] == []
+    assert [m.data.tobytes() for m in v1.result] == [b'vlan4:5556'] * 6
+
 @asyncloop_run
 async def test_speed(asyncloop):
     pcap = asyncloop.Channel('pcap://./tests/udp.pcap', name='pcap', speed='100')
