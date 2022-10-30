@@ -117,3 +117,25 @@ async def test_speed(asyncloop):
 
     assert [m.data.tobytes() for m in r0] == [b'ipv4:5555'] * 6
     assert [m.data.tobytes() for m in r1] == [b'ipv4:5556'] * 6
+
+@asyncloop_run
+async def test_tcp(asyncloop):
+    pcap = asyncloop.Channel('pcap://./tests/tcp.pcap', name='pcap')
+    t4 = asyncloop.Channel('pcap+tcp://127.0.0.1:5555', dump='text+hex', master=pcap, name='tcp4')
+    t6 = asyncloop.Channel('pcap+tcp://::1:5555', dump='text+hex', master=pcap, name='tcp6')
+
+    pcap.open()
+    t4.open()
+    t6.open()
+
+    assert await pcap.recv_state() == pcap.State.Active
+
+    m = await t4.recv(0.01)
+    assert m.data.tobytes() == b'tcp4:0'
+    m = await t6.recv(0.01)
+    assert m.data.tobytes() == b'tcp6:0'
+
+    m = await t4.recv(0.01)
+    assert m.data.tobytes() == b'tcp4:1'
+    m = await t6.recv(0.01)
+    assert m.data.tobytes() == b'tcp6:1'

@@ -25,6 +25,8 @@
 
 class Child;
 
+enum class Proto { Udp, Tcp };
+
 tll::time_point ts2ts(const struct timeval * tv)
 {
 	return tll::time_point { std::chrono::seconds(tv->tv_sec) + std::chrono::nanoseconds(tv->tv_usec) };
@@ -108,7 +110,7 @@ class PCap : public tll::channel::Base<PCap>
 	int _on_ipv6(tll_msg_t &msg, Frame &frame, View view);
 
 	template <typename Addr>
-	int _match(tll_msg_t &msg, const Frame &frame, const Addr &addr);
+	int _match(tll_msg_t &msg, const Frame &frame, Proto proto, const Addr &addr);
 
 	int _rearm(const tll::time_point &ts)
 	{
@@ -131,13 +133,22 @@ class Child : public tll::channel::Base<Child>
 	unsigned short _vlan = 0;
 	long long _seq = 0;
 	bool _autoseq = true;
+	Proto _proto = Proto::Udp;
 
  public:
-	static constexpr std::string_view channel_protocol() { return "pcap+udp"; }
+	static constexpr std::string_view channel_protocol() { return "pcap+"; }
 	static constexpr auto process_policy() { return ProcessPolicy::Never; }
 
 	int _init(const tll::Channel::Url &url, tll::Channel *master)
 	{
+		auto proto = url.proto();
+		if (proto == "pcap+udp")
+			_proto = Proto::Udp;
+		else if (proto == "pcap+tcp")
+			_proto = Proto::Tcp;
+		else
+			return _log.fail(EINVAL, "Invalid protocol: {}, only pcap+udp and pcap+tcp are available", proto);
+
 		_master = tll::channel_cast<PCap>(master);
 		if (!_master)
 			return _log.fail(EINVAL, "Need pcap master channel");
@@ -178,6 +189,7 @@ class Child : public tll::channel::Base<Child>
 	//tll::network::sockaddr_any & addr() { return _addr; }
 	auto & addr() { return _addr; }
 	auto vlan() const { return _vlan; }
+	auto proto() const { return _proto; }
 	auto autoseq() { return _autoseq; }
 	auto & seq() { return _seq; }
 };
@@ -296,11 +308,13 @@ int PCap::_close()
 }
 
 template <typename Addr>
-int PCap::_match(tll_msg_t &msg, const PCap::Frame &frame, const Addr &addr)
+int PCap::_match(tll_msg_t &msg, const PCap::Frame &frame, Proto proto, const Addr &addr)
 {
 	for (auto & c : _children) {
 		//_log.debug("Match {} with {}", addr, c->addr());
 		if (!c)
+			continue;
+		if (c->proto() != proto)
 			continue;
 		if (c->vlan() != frame.vlan)
 			continue;
@@ -362,18 +376,28 @@ int PCap::_on_ip(tll_msg_t &msg, Frame &frame, View view)
 	_log.trace("IP {} > {} {}", *(in_addr *) &ip->saddr, *(in_addr *) &ip->daddr, proto);
 	view = view.view(sizeof(iphdr));
 
+	sockaddr_in addr = {};
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = ip->daddr;;
+
 	if (proto == IPPROTO_UDP) {
 		auto udp = view.template dataT<udphdr>();
-
-		sockaddr_in addr = {};
-		addr.sin_family = AF_INET;
-		addr.sin_addr.s_addr = ip->daddr;;
 		addr.sin_port = udp->uh_dport;
 
 		view = view.view(sizeof(*udp));
 		msg.data = view.data();
 		msg.size = view.size();
-		return _match(msg, frame, addr);
+		return _match(msg, frame, Proto::Udp, addr);
+	} else if (proto == IPPROTO_TCP) {
+		auto tcp = view.template dataT<tcphdr>();
+		addr.sin_port = tcp->th_dport;
+
+		view = view.view(tcp->th_off * 4);
+		if (view.size() == 0) // Provide control message
+			return 0;
+		msg.data = view.data();
+		msg.size = view.size();
+		return _match(msg, frame, Proto::Tcp, addr);
 	}
 
 	return 0;
@@ -391,18 +415,28 @@ int PCap::_on_ipv6(tll_msg_t &msg, Frame &frame, View view)
 	_log.trace("IPv6 {} > {} {}", ip->ip6_src, ip->ip6_dst, proto);
 	view = view.view(sizeof(ip6_hdr));
 
+	sockaddr_in6 addr = {};
+	addr.sin6_family = AF_INET6;
+	addr.sin6_addr = ip->ip6_dst;;
+
 	if (proto == IPPROTO_UDP) {
 		auto udp = view.template dataT<udphdr>();
-
-		sockaddr_in6 addr = {};
-		addr.sin6_family = AF_INET6;
-		addr.sin6_addr = ip->ip6_dst;;
 		addr.sin6_port = udp->uh_dport;
 
 		view = view.view(sizeof(*udp));
 		msg.data = view.data();
 		msg.size = view.size();
-		return _match(msg, frame, addr);
+		return _match(msg, frame, Proto::Udp, addr);
+	} else if (proto == IPPROTO_TCP) {
+		auto tcp = view.template dataT<tcphdr>();
+		addr.sin6_port = tcp->th_dport;
+
+		view = view.view(tcp->th_off * 4);
+		if (view.size() == 0) // Provide control message
+			return 0;
+		msg.data = view.data();
+		msg.size = view.size();
+		return _match(msg, frame, Proto::Tcp, addr);
 	}
 
 	/*
