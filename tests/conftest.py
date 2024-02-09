@@ -14,5 +14,5 @@ tll.logger.init()
 @pytest.fixture
 def context():
     ctx = Context()
-    ctx.load(os.path.join(os.environ.get("BUILD_DIR", "build"), "tll-pcap"), 'channel_module')
+    ctx.load(os.path.join(os.environ.get("BUILD_DIR", "build"), "tll-pcap"))
     return ctx
