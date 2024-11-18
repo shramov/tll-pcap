@@ -10,6 +10,7 @@
 
 #include <tll/scheme/channel/timer.h>
 
+#include <tll/util/hostport.h>
 #include <tll/util/memoryview.h>
 #include <tll/util/size.h>
 #include <tll/util/sockaddr.h>
