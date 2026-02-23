@@ -379,9 +379,11 @@ int PCap::_on_ip(tll_msg_t &msg, Frame &frame, View view)
 
 	sockaddr_in addr = {};
 	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = ip->daddr;;
+	addr.sin_addr.s_addr = ip->daddr;
 
 	if (proto == IPPROTO_UDP) {
+		if (view.size() < sizeof(udphdr))
+			return _log.fail(EINVAL, "Truncated UDP header: {} < {}", view.size(), sizeof(udphdr));
 		auto udp = view.template dataT<udphdr>();
 		addr.sin_port = udp->uh_dport;
 
@@ -390,6 +392,8 @@ int PCap::_on_ip(tll_msg_t &msg, Frame &frame, View view)
 		msg.size = view.size();
 		return _match(msg, frame, Proto::Udp, addr);
 	} else if (proto == IPPROTO_TCP) {
+		if (view.size() < sizeof(tcphdr))
+			return _log.fail(EINVAL, "Truncated TCP header: {} < {}", view.size(), sizeof(tcphdr));
 		auto tcp = view.template dataT<tcphdr>();
 		addr.sin_port = tcp->th_dport;
 
@@ -418,7 +422,7 @@ int PCap::_on_ipv6(tll_msg_t &msg, Frame &frame, View view)
 
 	sockaddr_in6 addr = {};
 	addr.sin6_family = AF_INET6;
-	addr.sin6_addr = ip->ip6_dst;;
+	addr.sin6_addr = ip->ip6_dst;
 
 	if (proto == IPPROTO_UDP) {
 		auto udp = view.template dataT<udphdr>();
